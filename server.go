@@ -1,9 +1,9 @@
-package gorpc
+package goRpc
 
 import (
 	"encoding/json"
 	"fmt"
-	"goRpc/codec/codec"
+	"goRpc/codec"
 	"io"
 	"log"
 	"net"

@@ -1,12 +1,11 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	gorpc "goRpc/codec"
-	"goRpc/codec/codec"
+	gorpc "goRpc"
 	"log"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -24,30 +23,27 @@ func startServer(addr chan string) {
 	addr <- l.Addr().String()
 	gorpc.Accept(l)
 }
+
 func main() {
+	log.SetFlags(0)
 	addr := make(chan string)
 	go startServer(addr)
-
-	// 客户端连接服务端
-	conn, _ := net.Dial("tcp", <-addr)
-	defer func() { _ = conn.Close() }()
+	client, _ := gorpc.Dial("tcp", <-addr)
+	defer func() { _ = client.Close() }()
 
 	time.Sleep(time.Second)
-
-	// 客户端发送option
-	_ = json.NewEncoder(conn).Encode(gorpc.DefaultOption)
-	cc := codec.NewGobCodec(conn)
-
-	// 客户端发送请求，接收响应
+	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
-		h := &codec.Header{
-			ServiceMethod: "Foo.Sum",
-			Seq:           uint64(i),
-		}
-		_ = cc.Write(h, fmt.Sprintf("geerpc req %d", i))
-		_ = cc.ReadHeader(h)
-		var reply string
-		_ = cc.ReadBody(&reply)
-		log.Println("reply:", reply)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			args := fmt.Sprintf("gorpc req %d", i)
+			var reply string
+			if err := client.Call("Foo.Sum", args, &reply); err != nil {
+				log.Fatal("rpc client: call Foo.Sum error:", err)
+			}
+			log.Println("rpc client: call Foo.Sum reply:", reply)
+		}(i)
 	}
+	wg.Wait()
 }
