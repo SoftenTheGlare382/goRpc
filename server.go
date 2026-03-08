@@ -2,13 +2,16 @@ package goRpc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"goRpc/codec"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
+	"time"
 )
 
 const MagicNumber = 0x3bef5c
@@ -17,19 +20,25 @@ const MagicNumber = 0x3bef5c
 //
 //	@Description: 通信过程协商，包括编解码方式
 type Option struct {
-	MagicNumber int32      // MagicNumber marks this's a geerpc request
-	CodecType   codec.Type // client may choose different Codec to encode body
+	MagicNumber    int32         // MagicNumber marks this's a geerpc request
+	CodecType      codec.Type    // client may choose different Codec to encode body
+	ConnectTimeout time.Duration // 连接超时时间，默认0表示不超时
+	HandleTimeout  time.Duration // 处理超时时间，默认0表示不超时
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
+	//HandleTimeout:  0,
 }
 
 // Server
 //
 //	@Description:RPC服务端
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map // 并发安全的服务映射，键为服务名，值为服务实例
+}
 
 // NewServer
 //
@@ -88,7 +97,7 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 		log.Println("rpc server: invalid codec type:", opt.CodecType)
 		return
 	}
-	server.serveCodec(codecFunc(conn))
+	server.serveCodec(codecFunc(conn), &opt)
 }
 
 var invalidRequest = struct{}{}
@@ -98,7 +107,7 @@ var invalidRequest = struct{}{}
 //	@Description: 处理单个连接，读取请求，处理请求，回复请求
 //	@receiver server
 //	@param cc 连接实例
-func (server *Server) serveCodec(cc codec.Codec) {
+func (server *Server) serveCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 	for {
@@ -112,7 +121,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -123,6 +132,8 @@ func (server *Server) serveCodec(cc codec.Codec) {
 type request struct {
 	h            *codec.Header // request header
 	argv, replyv reflect.Value // argv and replyv of request
+	mtype        *methodType
+	svc          *service
 }
 
 // readRequestHeader
@@ -156,15 +167,32 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 		return nil, err
 	}
 	req := &request{h: h}
-	// TODO: now we don't know the type of request argv
-	// day 1, just suppose it's string
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server: read argv err:", err)
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return nil, err
+	}
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+	if err = cc.ReadBody(argvi); err != nil {
+		log.Println("rpc server: read body err:", err)
+		return req, err
 	}
 	return req, nil
 }
 
+// sendResponse
+//
+//	@Description: 发送响应
+//	@receiver server
+//	@param cc 连接实例
+//	@param h 请求头
+//	@param body 响应体
+//	@param sending 互斥锁，确保响应发送是原子操作
 func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
@@ -173,11 +201,92 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 	}
 }
 
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
-	// TODO, should call registered rpc methods to get the right replyv
+// handleRequest
+//
+//	@Description: 处理请求，根据请求头调用注册的方法，回复请求
+//	@receiver server
+//	@param cc 连接实例
+//	@param req 请求实例
+//	@param sending 互斥锁，确保响应发送是原子操作
+//	@param wg 等待组，确保所有请求处理完成后关闭连接
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	// day 1, just print argv and send a hello message
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+	if timeout == 0 {
+		<-called
+		<-sent
+		return
+	}
+	select {
+	case <-called:
+		<-sent
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+	}
+
+}
+
+// Register
+//
+//	@Description: 注册服务，将服务实例存储到服务映射中
+//	@receiver server
+//	@param rcvr 服务实例
+//	@return error 错误信息
+func (server *Server) Register(rcvr interface{}) error {
+	s := newService(rcvr)
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc: service already defined: " + s.name)
+	}
+	return nil
+}
+
+// Register
+//
+//	@Description: 注册服务，将服务实例存储到默认服务映射中
+//	@param rcvr 服务实例
+//	@return error 错误信息
+func Register(rcvr interface{}) error {
+	return DefaultServer.Register(rcvr)
+}
+
+// findService
+//
+//	@Description: 查找服务和方法
+//	@receiver server
+//	@param serviceMethod 服务方法名，格式为"服务名.方法名"
+//	@return svc 服务实例
+//	@return mtype 方法类型
+//	@return err 错误信息
+func (server *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	dot := strings.Index(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc: service/method not found: " + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	if svci, ok := server.serviceMap.Load(serviceName); !ok {
+		err = errors.New("rpc: service not found: " + serviceName)
+		return
+	} else {
+		svc = svci.(*service)
+	}
+	if mtype = svc.method[methodName]; mtype == nil {
+		err = errors.New("rpc: method not found: " + methodName)
+	}
+	return
 }
