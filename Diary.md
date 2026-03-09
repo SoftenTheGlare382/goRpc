@@ -167,7 +167,56 @@ goRPC需要在三个地方添加超时处理：
 这里需要确保 sendResponse 仅调用一次，因此将整个过程拆分为 called 和 sent 两个阶段，在这段代码中只会发生如下两种情况：
 
 called 信道接收到消息，代表处理没有超时，继续执行 sendResponse。
+
 time.After() 先于 called 接收到消息，说明处理已经超时，called 和 sent 都将被阻塞。在 case <-time.After(timeout) 处调用 sendResponse。
+
+# Day 4
+## 20260309
+
+## 支持http协议
+RPC的消息格式与标准http协议并不兼容，我们需要进行协议转换，这里会用到http中的CONNECT方法（一般用于代理服务）
+
+通常在https报文中，通信报文内容都是加密的，这会导致浏览器通过代理服务器发起https请求时不知道向何处发送请求。CONNECT被用于解决这个问题，浏览器会使用他向代理服务器用http明文发送一条CONNECT请求告知目标地址和端口号，使得代理服务器和目标站点之间建立tcp连接，从而使得后续的http报文交换能顺利进行
+
+而对于RPC服务端来说，就需要将http协议更换为RPC协议；对于客户端来说，需要新增通过HTTP CONNECT请求创建直接连接的逻辑。
+
+### 1.对于服务端
+通信过程主要是客户端向RPC服务器发送CONNECT请求，服务器接收到请求后，返回HTTP 200表示连接建立；客户端再使用该TCP连接进行RPC通信
+
+其中defaultDebugPath 是为后续 DEBUG 页面预留的地址
+
+### 2.对于客户端
+客户端首先要做的是向RPC服务器发送CONNECT请求，服务器接收到请求后，返回HTTP 200表示连接建立；客户端再检查返回的状态码
+
+http CONNECT 连接建立完成后，后续通信过程交给NewClient处理,处理过程可简化为一个函数XDial
+
+### 3.实现一个debug页面，展示当前注册的服务和方法，以及调用次数
+
+## 负载均衡
+选择采用随机选择和Round Robin 轮询调度算法实现RPC服务端负载均衡（可尝试采用一致性哈希算法）
+
+### 4.简略的服务发现模块Discovery,将负载均衡与通信模块解耦
+定义 2 个类型：
+
+SelectMode 代表不同的负载均衡策略，简单起见，GeeRPC 仅实现 Random 和 RoundRobin 两种策略。
+
+Discovery 是一个接口类型，包含了服务发现所需要的最基本的接口。
+Refresh() 从注册中心更新服务列表
+Update(servers []string) 手动更新服务列表
+Get(mode SelectMode) 根据负载均衡策略，选择一个服务实例
+GetAll() 返回所有的服务实例
+
+### 5.向用户暴露一个支持负载均衡的客户端
+
+### 6.添加broadcast方法，用于向所有服务实例广播调用
+为了提升性能，请求是并发的。
+并发情况下需要使用互斥锁保证 error 和 reply 能被正确赋值。
+借助 context.WithCancel 确保有错误发生时，快速失败。
+
+### 
+
+
+
 
 
 

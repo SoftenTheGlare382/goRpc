@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -289,4 +290,49 @@ func (server *Server) findService(serviceMethod string) (svc *service, mtype *me
 		err = errors.New("rpc: method not found: " + methodName)
 	}
 	return
+}
+
+const (
+	connected        = "200 Connected to RPC Server"
+	defaultRPCPath   = "/_gorpc_"
+	defaultDebugPath = "/debug/gorpc"
+)
+
+// ServeHTTP
+//
+//	@Description: 在TCP连接上处理HTTP的CONNECT请求
+//	@receiver server
+//	@param w HTTP响应写入器
+//	@param req HTTP请求实例
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Println("rpc server: hijack error:", err)
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	server.ServeConn(conn)
+}
+
+// HandleHTTP
+//
+//	@Description: 注册HTTP处理路径
+//	@receiver server
+func (server *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, server)
+	http.Handle(defaultDebugPath, debugHTTP{server})
+	log.Println("rpc server: debug path:", defaultDebugPath)
+}
+
+// HandleHTTP
+//
+//	@Description: 注册默认的HTTP处理路径
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }

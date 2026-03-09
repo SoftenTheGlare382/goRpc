@@ -1,6 +1,7 @@
 package goRpc
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -344,5 +347,63 @@ func (client *Client) Call(ctx context.Context, serviceMethod string, args, repl
 		return errors.New("rpc client: call failed: " + ctx.Err().Error())
 	case call := <-call.Done:
 		return call.Error
+	}
+}
+
+// NewHTTPClient
+//
+//	@Description: 创建一个HTTP客户端，用于连接到RPC服务端
+//	@param conn 网络连接实例
+//	@param opt 客户端选项
+//	@return *Client 客户端实例
+//	@return error 创建客户端时可能返回的错误
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	// 发送CONNECT请求
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+
+	//需要接收到成功的HTTP响应才能转换为RPC协议
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+
+	if err == nil && resp.Status == "200 Connected to RPC Server" {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+
+// DialHTTP
+//
+//	@Description: 连接到RPC服务端，返回一个新的HTTP客户端实例
+//	@param network 网络类型，如"tcp"
+//	@param address 服务端地址，如"localhost:8000"
+//	@param opts 客户端选项
+//	@return *Client 客户端实例
+//	@return error 连接时可能返回的错误
+func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+// XDial
+//
+//	@Description: 连接到RPC服务端，根据协议类型选择不同的连接方式
+//	@param rpcAddr 服务端地址，格式为 "protocol@addr"
+//	@param opts 客户端选项
+//	@return *Client 客户端实例
+//	@return error 连接时可能返回的错误
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@") // rpcAddr 格式为 "protocol@addr"
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client: invalid rpcAddr format: %s", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		// HTTP协议，使用HTTP客户端连接
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// 其他协议，默认使用TCP
+		return Dial(protocol, addr, opts...)
 	}
 }
