@@ -245,6 +245,10 @@ Post: 注册服务，通过自定义字段X-GoRpc-Server承载
 ### 4.实现服务发现方法，客户端向注册中心询问当前可用的服务实例列表，注册中心会返回一个服务实例列表
 实现Update和Refresh方法，超时获取逻辑在Refresh中实现
 
+problem:服务端无法返回正确的结果，导致客户端调用失败
+
+这其实是由于服务端处理http报文时，对于方法的选择是基于http method的，而http method通常格式是“GET”和“POST“，并非”Get“和”Post“
+
 
 
 
