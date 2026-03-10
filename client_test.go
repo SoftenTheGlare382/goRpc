@@ -1,4 +1,4 @@
-package goRpc
+package gorpc
 
 import (
 	"context"
